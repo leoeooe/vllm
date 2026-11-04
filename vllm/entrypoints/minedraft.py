@@ -85,10 +85,16 @@ def _engine_process(connection: Connection, config: _EngineConfig) -> None:
         from vllm import LLM, SamplingParams
         from vllm.inputs import TokensPrompt
         from vllm.outputs import RequestOutput
+        from vllm.platforms import current_platform
         from vllm.sampling_params import RequestOutputKind
         from vllm.v1.core.sched.scheduler import Scheduler
         from vllm.v1.engine.core_client import InprocClient
 
+        if current_platform.device_type != config.device:
+            raise RuntimeError(
+                f"MineDraft requested {config.device} but the active vLLM platform "
+                f"uses {current_platform.device_type}; select the matching plugin"
+            )
         kwargs = dict(config.kwargs)
         kwargs.update(
             model=config.model,

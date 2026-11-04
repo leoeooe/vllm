@@ -20,6 +20,9 @@ from unittest.mock import patch
 SPAWN_VISIBLE_DEVICES = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
 SPAWN_MODEL_RUNNER = os.environ.get("VLLM_USE_V2_MODEL_RUNNER")
 SPAWN_HCCL_PORT_RANGE = os.environ.get("HCCL_NPU_SOCKET_PORT_RANGE")
+# Spawn imports the installed accelerator packages before entering the fixture.
+# Startup latency is not a performance assertion in these transport tests.
+STARTUP_TIMEOUT = 120
 
 if __name__ in ("__main__", "__mp_main__"):
     repository = Path(__file__).resolve().parents[3]
@@ -146,8 +149,9 @@ class TestMineDraftRuntime(unittest.TestCase):
 
     def test_actor_timeout_preserves_connection_for_shutdown(self):
         actor = runtime._Actor(_config())
+        self.addCleanup(actor.close)
         try:
-            self.assertEqual(actor.receive(10)[0], "ready")
+            self.assertEqual(actor.receive(STARTUP_TIMEOUT)[0], "ready")
             with self.assertRaises(TimeoutError):
                 actor.receive(0.01)
         finally:
@@ -161,12 +165,13 @@ class TestMineDraftRuntime(unittest.TestCase):
             for name in runtime._actor_environment(_config("environment"))
         }
         actor = runtime._Actor(_config("environment"))
+        self.addCleanup(actor.close)
         try:
             expected_port_range = original["HCCL_NPU_SOCKET_PORT_RANGE"]
             if expected_port_range is None:
                 expected_port_range = "auto"
             self.assertEqual(
-                actor.receive(10),
+                actor.receive(STARTUP_TIMEOUT),
                 ("ready", "0", "1", expected_port_range),
             )
             self.assertEqual(
@@ -182,9 +187,10 @@ class TestMineDraftRuntime(unittest.TestCase):
         ):
             with self.subTest(mode=mode):
                 actor = runtime._Actor(_config(mode))
+                self.addCleanup(actor.close)
                 try:
                     with self.assertRaisesRegex(RuntimeError, expected):
-                        actor.receive(10)
+                        actor.receive(STARTUP_TIMEOUT)
                 finally:
                     actor.close()
                 self.assertIsNotNone(actor.process.exitcode)
@@ -192,8 +198,9 @@ class TestMineDraftRuntime(unittest.TestCase):
 
     def test_shutdown_terminates_child_before_process_group_setup(self):
         actor = runtime._Actor(_config("before-setsid"))
-        self.assertEqual(actor.receive(10)[0], "ready")
+        self.addCleanup(actor.close)
         try:
+            self.assertEqual(actor.receive(STARTUP_TIMEOUT)[0], "ready")
             actor.close()
         finally:
             if actor.process.is_alive():
@@ -205,23 +212,31 @@ class TestMineDraftRuntime(unittest.TestCase):
     def test_shutdown_reaps_workers_after_engine_leader_exited(self):
         with patch.object(runtime, "_engine_process", _orphaning_engine_service):
             actor = runtime._Actor(_config())
-        worker_pid = actor.receive(10)[1]
-        worker_fd = os.pidfd_open(worker_pid)
+            self.addCleanup(actor.close)
+        worker_fd = None
         try:
-            actor.process.join(timeout=10)
+            worker_pid = actor.receive(STARTUP_TIMEOUT)[1]
+            worker_fd = os.pidfd_open(worker_pid)
+            actor.process.join(timeout=STARTUP_TIMEOUT)
             self.assertFalse(actor.process.is_alive())
             actor.close()
             self.assertEqual(select.select([worker_fd], [], [], 5)[0], [worker_fd])
         finally:
-            if not select.select([worker_fd], [], [], 0)[0]:
-                os.kill(worker_pid, signal.SIGKILL)
-            os.close(worker_fd)
+            if worker_fd is not None:
+                if not select.select([worker_fd], [], [], 0)[0]:
+                    os.kill(worker_pid, signal.SIGKILL)
+                os.close(worker_fd)
             actor.close()
 
     def test_diagnostics_failure_closes_all_engine_actors(self):
         existing = {child.pid for child in mp.active_children()}
         with runtime.MineDraftLLM(
-            "diagnostics-error", "target", [0], [[1]], num_batches=2, timeout=10
+            "diagnostics-error",
+            "target",
+            [0],
+            [[1]],
+            num_batches=2,
+            timeout=STARTUP_TIMEOUT,
         ) as llm:
             with self.assertRaisesRegex(RuntimeError, "test diagnostics failure"):
                 llm.get_diagnostics()
@@ -234,7 +249,9 @@ class TestMineDraftRuntime(unittest.TestCase):
     def test_startup_failure_closes_previously_started_engine_actors(self):
         existing = {child.pid for child in mp.active_children()}
         with self.assertRaisesRegex(RuntimeError, "test engine startup failure"):
-            runtime.MineDraftLLM("draft", "startup-error", [0], [[1], [2]], timeout=10)
+            runtime.MineDraftLLM(
+                "draft", "startup-error", [0], [[1], [2]], timeout=STARTUP_TIMEOUT
+            )
         self.assertFalse(
             [child for child in mp.active_children() if child.pid not in existing]
         )

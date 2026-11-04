@@ -173,3 +173,33 @@ intended hardware with:
 Greedy output can differ under different batches because of floating-point
 rounding. Use a supported batch-invariant configuration for exact comparisons,
 and investigate mismatches rather than relaxing checks automatically.
+
+### Development checks without accelerator devices
+
+From the vLLM repository, the control and transport tests can run without model
+weights:
+
+```bash
+.venv/bin/python tests/v1/spec_decode/test_minedraft.py -v
+.venv/bin/python tests/v1/spec_decode/test_minedraft_runtime.py -v
+```
+
+To exercise the real scheduler and candidate-buffer objects with the installed
+CPU PyTorch environment, use:
+
+```bash
+VLLM_TARGET_DEVICE=cpu \
+VLLM_CACHE_ROOT=/home/l00998189/.cache/vllm \
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 VLLM_PLUGINS='' \
+.venv/bin/python -m pytest \
+    tests/v1/core/test_scheduler.py \
+    tests/v1/worker/test_draft_tokens_handler.py \
+    -k 'minedraft or external_drafts' -q
+```
+
+The same environment can run the two control/transport files under ordinary
+pytest. The transport suite replaces only the external engine service and
+spawns real processes; it does not load real model weights. Its startup deadline
+allows for importing installed accelerator packages, while a separate test
+checks short RPC timeout handling. These checks supplement the hardware tests;
+they do not replace NPU numerical, replay, or performance validation.
