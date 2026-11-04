@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 # Process-lifetime serialization of MineDraft's temporary spawn environment.
 # Each constructor restores the caller's environment before returning from start.
 _ENGINE_START_LOCK = threading.Lock()
+_ENGINE_SHUTDOWN_GRACE_SECONDS = 30
 
 
 @dataclass(frozen=True)
@@ -247,6 +248,8 @@ class _Actor:
         self.connection, child = context.Pipe()
         self.process = context.Process(target=_engine_process, args=(child, config))
         self._closed = False
+        self._ready = False
+        self._failed = False
         try:
             # Spawn imports vllm (and therefore torch) before invoking the target.
             # Device visibility must be inherited by that fresh interpreter.
@@ -271,18 +274,23 @@ class _Actor:
     def receive(self, timeout: float) -> tuple:
         ready = wait([self.connection, self.process.sentinel], timeout)
         if self.connection not in ready:
+            self._failed = True
             if self.process.sentinel in ready:
                 raise RuntimeError(f"MineDraft engine exited: {self.process.exitcode}")
             raise TimeoutError("MineDraft engine timed out")
         try:
             message = self.connection.recv()
         except EOFError as exc:
+            self._failed = True
             raise RuntimeError("MineDraft engine closed its connection") from exc
         if message[0] == "error":
+            self._failed = True
             raise RuntimeError(f"MineDraft engine failed:\n{message[1]}")
+        if message[0] == "ready":
+            self._ready = True
         return message
 
-    def close(self) -> None:
+    def close(self, *, graceful: bool = True) -> None:
         if self._closed:
             return
         self._closed = True
@@ -292,7 +300,14 @@ class _Actor:
             if self.process.is_alive():
                 with contextlib.suppress(BrokenPipeError, OSError):
                     self.connection.send(("close", None))
-            self.process.join(timeout=5)
+            # The native executor itself waits for workers and then unlinks its
+            # shared-memory queues. Let it finish before killing the whole group.
+            grace = (
+                _ENGINE_SHUTDOWN_GRACE_SECONDS
+                if graceful and self._ready and not self._failed
+                else 0
+            )
+            self.process.join(timeout=grace)
             # TP workers can outlive an already-exited actor. Its process group
             # must be cleaned up even when the leader is no longer alive.
             with contextlib.suppress(ProcessLookupError):
@@ -442,7 +457,7 @@ class MineDraftLLM:
                 raise ValueError("Draft/target tokenizer mappings or EOS IDs differ")
             self._max_token_id = ready[0][2]
         except BaseException:
-            self.close()
+            self._close_actors(graceful=False)
             raise
 
     def generate(
@@ -541,7 +556,7 @@ class MineDraftLLM:
             return [final_outputs[req.request_id] for req in requests]
         except BaseException:
             # A partially advanced native scheduler cannot be reused safely.
-            self.close()
+            self._close_actors(graceful=False)
             raise
         finally:
             self._busy = False
@@ -564,7 +579,7 @@ class MineDraftLLM:
                     raise RuntimeError("Invalid diagnostics response")
                 results.append(message[1])
         except BaseException:
-            self.close()
+            self._close_actors(graceful=False)
             raise
         return {
             "draft": results[0],
@@ -574,13 +589,16 @@ class MineDraftLLM:
 
     def close(self) -> None:
         """Release engines, including all tensor-parallel worker processes."""
+        self._close_actors(graceful=True)
+
+    def _close_actors(self, *, graceful: bool) -> None:
         if self._closed:
             return
         self._closed = True
         errors = []
         for actor in self._actors:
             try:
-                actor.close()
+                actor.close(graceful=graceful)
             except Exception as exc:
                 errors.append(exc)
         if errors:
@@ -590,4 +608,4 @@ class MineDraftLLM:
         return self
 
     def __exit__(self, *args: Any) -> None:
-        self.close()
+        self._close_actors(graceful=args[0] is None)

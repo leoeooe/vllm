@@ -6,12 +6,14 @@ The external engine service is replaced, not the controller or multiprocessing
 transport. No model inference or accelerator correctness is asserted here.
 """
 
+import contextlib
 import importlib.util
 import multiprocessing as mp
 import os
 import select
 import signal
 import sys
+import threading
 import unittest
 from pathlib import Path
 from typing import Any
@@ -63,6 +65,12 @@ def _engine_service(connection, config):
             connection.send(("ready", "same-tokenizer", 100))
         while True:
             command, _ = connection.recv()
+            if command == "close" and config.model == "slow-shutdown":
+                connection.send(("shutdown-started", None))
+                command, _ = connection.recv()
+                if command != "finish-shutdown":
+                    raise RuntimeError("Unexpected shutdown command")
+                return
             if command == "close" and config.model != "before-setsid":
                 return
             if command == "diagnostics":
@@ -159,6 +167,35 @@ class TestMineDraftRuntime(unittest.TestCase):
         self.assertFalse(actor.process.is_alive())
         actor.close()
 
+    def test_shutdown_waits_for_native_worker_cleanup(self):
+        actor = runtime._Actor(_config("slow-shutdown"))
+        self.addCleanup(actor.close)
+        self.assertEqual(actor.receive(STARTUP_TIMEOUT)[0], "ready")
+        process_fd = os.pidfd_open(actor.process.pid)
+        errors = []
+
+        def close_actor():
+            try:
+                actor.close()
+            except BaseException as exc:
+                errors.append(exc)
+
+        closer = threading.Thread(target=close_actor)
+        closer.start()
+        try:
+            self.assertEqual(actor.receive(STARTUP_TIMEOUT)[0], "shutdown-started")
+            # Native executor shutdown has its own five-second worker grace.
+            # Hold cleanup past that boundary and detect premature process exit.
+            self.assertEqual(select.select([process_fd], [], [], 6)[0], [])
+        finally:
+            with contextlib.suppress(BrokenPipeError, OSError):
+                actor.connection.send(("finish-shutdown", None))
+            closer.join(timeout=STARTUP_TIMEOUT)
+            os.close(process_fd)
+        self.assertFalse(closer.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(actor.process.exitcode, 0)
+
     def test_spawn_inherits_device_environment_before_module_import(self):
         original = {
             name: os.environ.get(name)
@@ -201,7 +238,7 @@ class TestMineDraftRuntime(unittest.TestCase):
         self.addCleanup(actor.close)
         try:
             self.assertEqual(actor.receive(STARTUP_TIMEOUT)[0], "ready")
-            actor.close()
+            actor.close(graceful=False)
         finally:
             if actor.process.is_alive():
                 actor.process.kill()
