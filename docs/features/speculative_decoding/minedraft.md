@@ -121,6 +121,47 @@ rank. Run enough decode rounds to exercise those shapes. With a draft length
 of one, draft generation may consist only of prefill and provide no decode
 graph replay.
 
+## Profiling a short overlap window
+
+Enable native worker profiling by passing `profiler_config` to the constructor:
+
+```python
+profiler_config = {
+    "profiler": "torch",
+    "torch_profiler_dir": "/tmp/minedraft-profile",
+    "torch_profiler_with_stack": False,
+    "torch_profiler_with_memory": False,
+}
+```
+
+After construction, warm up with an ordinary generation call before opening a
+short profiling window:
+
+```python
+llm.generate(prompts, SamplingParams(temperature=0, max_tokens=12))
+llm.start_profile("graph_overlap")
+outputs = llm.generate(prompts, SamplingParams(temperature=0, max_tokens=12))
+llm.stop_profile()
+```
+
+Start and stop commands are sent to every actor before waiting for any actor's
+acknowledgement. Generation starts only after all profilers acknowledge startup;
+`stop_profile()` returns after all native worker profilers finish exporting.
+Normal `close()` also stops an active profiling session. Control failures abort
+the cluster, and the entire start or stop operation is bounded by `timeout`.
+
+Trace prefixes gain `_draft` or `_verifier<N>` before native TP/rank suffixes,
+so independent verifier replicas have distinct names. `start_profile()` accepts
+the native `delay_iterations`, `max_iterations`, and `profiler_kwargs` options.
+Iteration limits count each engine independently and may truncate different
+parts of the overlap window; a short generation call with no iteration limit
+preserves a shared wall-clock window. Backend support for `profiler_kwargs` and
+renaming later sessions follows the native profiler implementation. For Ascend
+backends that retain the first trace name, use one session per cluster.
+
+Profiling changes execution overhead. Use exported device traces to inspect
+kernel overlap; measure unprofiled runs separately for performance comparisons.
+
 ## Sampling and lifecycle
 
 The drafter uses deterministic greedy decoding. The verifier uses vLLM's

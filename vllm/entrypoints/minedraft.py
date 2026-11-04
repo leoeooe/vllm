@@ -133,6 +133,14 @@ def _engine_process(connection: Connection, config: _EngineConfig) -> None:
             command, payload = connection.recv()
             if command == "close":
                 break
+            if command == "start_profile":
+                llm.start_profile(**payload)
+                connection.send((command, None))
+                continue
+            if command == "stop_profile":
+                llm.stop_profile()
+                connection.send((command, None))
+                continue
             if command == "diagnostics":
                 workers = (
                     llm.collective_rpc(config.probe_method)
@@ -425,6 +433,7 @@ class MineDraftLLM:
         self._actors: list[_Actor] = []
         self._busy = False
         self._closed = False
+        self._profile_active = False
         common = {
             "max_model_len": self.max_model_len,
             "max_num_seqs": self.max_num_seqs,
@@ -561,6 +570,94 @@ class MineDraftLLM:
         finally:
             self._busy = False
 
+    def start_profile(
+        self,
+        profile_prefix: str | None = None,
+        *,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
+        profiler_kwargs: dict[str, Any] | None = None,
+    ) -> None:
+        """Start native worker profilers on all engines before accepting work.
+
+        The constructor's ``profiler_config`` must enable profiling. Trace names
+        append ``_draft`` or ``_verifier<N>`` before the native worker rank suffix.
+        Iteration limits count each engine's own steps independently.
+        """
+        if self._closed or self._busy:
+            raise RuntimeError("Profiling requires an idle, open MineDraftLLM")
+        if self._profile_active:
+            raise RuntimeError("A MineDraft profiling session is already active")
+        for name, value in (
+            ("delay_iterations", delay_iterations),
+            ("max_iterations", max_iterations),
+        ):
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError(f"{name} must be a nonnegative integer or None")
+        prefix = "minedraft" if profile_prefix is None else profile_prefix
+        if (
+            not isinstance(prefix, str)
+            or not prefix
+            or not prefix.isascii()
+            or not prefix[0].isalnum()
+            or any(not (char.isalnum() or char in "._-") for char in prefix[1:])
+        ):
+            raise ValueError("profile_prefix must be an ASCII filename prefix")
+        prefixes = [f"{prefix}_draft"] + [
+            f"{prefix}_verifier{index}" for index in range(len(self._actors) - 1)
+        ]
+        if any(len(name) > 128 for name in prefixes):
+            raise ValueError("profile_prefix plus engine suffix exceeds 128 characters")
+        self._profile_control(
+            "start_profile",
+            [
+                {
+                    "profile_prefix": name,
+                    "delay_iterations": delay_iterations,
+                    "max_iterations": max_iterations,
+                    "profiler_kwargs": profiler_kwargs,
+                }
+                for name in prefixes
+            ],
+        )
+        self._profile_active = True
+
+    def stop_profile(self) -> None:
+        """Stop all native worker profilers and wait for their trace exports."""
+        if self._closed or self._busy:
+            raise RuntimeError("Profiling requires an idle, open MineDraftLLM")
+        if not self._profile_active:
+            raise RuntimeError("No MineDraft profiling session is active")
+        self._profile_control("stop_profile", [None] * len(self._actors))
+        self._profile_active = False
+
+    def _profile_control(self, command: str, payloads: Sequence[Any]) -> None:
+        self._busy = True
+        try:
+            deadline = time.monotonic() + self.timeout
+            for actor, payload in zip(self._actors, payloads, strict=True):
+                actor.connection.send((command, payload))
+            pending = set(self._actors)
+            while pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"MineDraft {command} exceeded timeout")
+                ready = wait(
+                    [actor.connection for actor in pending], timeout=min(remaining, 1)
+                )
+                for actor in tuple(pending):
+                    if actor.connection in ready:
+                        if actor.receive(remaining) != (command, None):
+                            raise RuntimeError(f"Invalid MineDraft {command} response")
+                        pending.remove(actor)
+                    elif not actor.process.is_alive():
+                        raise RuntimeError(f"MineDraft engine exited during {command}")
+        except BaseException:
+            self._close_actors(graceful=False)
+            raise
+        finally:
+            self._busy = False
+
     def get_diagnostics(self) -> dict[str, Any]:
         """Return worker probes, native metrics and host operation intervals.
 
@@ -589,12 +686,15 @@ class MineDraftLLM:
 
     def close(self) -> None:
         """Release engines, including all tensor-parallel worker processes."""
+        if not self._closed and self._profile_active:
+            self.stop_profile()
         self._close_actors(graceful=True)
 
     def _close_actors(self, *, graceful: bool) -> None:
         if self._closed:
             return
         self._closed = True
+        self._profile_active = False
         errors = []
         for actor in self._actors:
             try:
@@ -608,4 +708,7 @@ class MineDraftLLM:
         return self
 
     def __exit__(self, *args: Any) -> None:
-        self._close_actors(graceful=args[0] is None)
+        if args[0] is None:
+            self.close()
+        else:
+            self._close_actors(graceful=False)

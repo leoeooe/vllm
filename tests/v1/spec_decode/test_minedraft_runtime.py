@@ -15,6 +15,7 @@ import signal
 import sys
 import threading
 import unittest
+from functools import partial
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -42,10 +43,11 @@ else:
     from vllm.entrypoints import minedraft as runtime
 
 
-def _engine_service(connection, config):
+def _engine_service(connection, config, profile_barrier=None, stopped_profiles=None):
     """External engine fixture with real connection, exit and error behavior."""
     if config.model != "before-setsid":
         os.setsid()
+    profile_commands = []
     try:
         if config.model == "startup-error":
             connection.send(("error", "test engine startup failure"))
@@ -64,7 +66,23 @@ def _engine_service(connection, config):
         else:
             connection.send(("ready", "same-tokenizer", 100))
         while True:
-            command, _ = connection.recv()
+            command, payload = connection.recv()
+            if command in ("start_profile", "stop_profile"):
+                fail_mode = (
+                    "profile-start-error"
+                    if command == "start_profile"
+                    else "profile-stop-error"
+                )
+                if config.model == fail_mode:
+                    connection.send(("error", f"test {command} failure"))
+                    return
+                if profile_barrier is not None:
+                    profile_barrier.wait(STARTUP_TIMEOUT)
+                profile_commands.append((command, payload))
+                if command == "stop_profile" and stopped_profiles is not None:
+                    stopped_profiles.put(config.devices)
+                connection.send((command, None))
+                continue
             if command == "close" and config.model == "slow-shutdown":
                 connection.send(("shutdown-started", None))
                 command, _ = connection.recv()
@@ -77,7 +95,12 @@ def _engine_service(connection, config):
                 if config.model == "diagnostics-error":
                     connection.send(("error", "test diagnostics failure"))
                     return
-                connection.send(("diagnostics", {"pid": os.getpid()}))
+                connection.send(
+                    (
+                        "diagnostics",
+                        {"pid": os.getpid(), "profile_commands": profile_commands},
+                    )
+                )
     finally:
         connection.close()
 
@@ -292,6 +315,85 @@ class TestMineDraftRuntime(unittest.TestCase):
         self.assertFalse(
             [child for child in mp.active_children() if child.pid not in existing]
         )
+
+    def test_profile_controls_reach_all_actors_before_waiting_and_close_exports(self):
+        context = mp.get_context("spawn")
+        barrier = context.Barrier(3)
+        stopped = context.Queue()
+        self.addCleanup(stopped.close)
+        service = partial(
+            _engine_service, profile_barrier=barrier, stopped_profiles=stopped
+        )
+        with (
+            patch.object(runtime, "_engine_process", service),
+            runtime.MineDraftLLM(
+                "draft", "target", [0], [[1], [2]], timeout=STARTUP_TIMEOUT
+            ) as llm,
+        ):
+            invalid_profiles: list[dict[str, Any]] = [
+                {"profile_prefix": "../bad"},
+                {"profile_prefix": "a" * 128},
+                {"delay_iterations": True},
+                {"max_iterations": -1},
+            ]
+            for kwargs in invalid_profiles:
+                with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                    llm.start_profile(**kwargs)
+            llm.start_profile(
+                "overlap",
+                delay_iterations=2,
+                max_iterations=4,
+                profiler_kwargs={"preset": "light"},
+            )
+            diagnostics = llm.get_diagnostics()
+            engines = [diagnostics["draft"], *diagnostics["verifiers"]]
+            for result, role in zip(engines, ("draft", "verifier0", "verifier1")):
+                self.assertEqual(
+                    result["profile_commands"],
+                    [
+                        (
+                            "start_profile",
+                            {
+                                "profile_prefix": f"overlap_{role}",
+                                "delay_iterations": 2,
+                                "max_iterations": 4,
+                                "profiler_kwargs": {"preset": "light"},
+                            },
+                        )
+                    ],
+                )
+            with self.assertRaisesRegex(RuntimeError, "already active"):
+                llm.start_profile()
+            llm.stop_profile()
+            with self.assertRaisesRegex(RuntimeError, "No MineDraft"):
+                llm.stop_profile()
+            llm.start_profile()
+        self.assertEqual(
+            sorted(stopped.get(timeout=STARTUP_TIMEOUT) for _ in range(6)),
+            [(0,), (0,), (1,), (1,), (2,), (2,)],
+        )
+
+    def test_profile_failure_closes_all_engine_actors(self):
+        for mode in ("profile-start-error", "profile-stop-error"):
+            with self.subTest(mode=mode):
+                existing = {child.pid for child in mp.active_children()}
+                with runtime.MineDraftLLM(
+                    "draft", mode, [0], [[1]], timeout=STARTUP_TIMEOUT
+                ) as llm:
+                    with self.assertRaisesRegex(
+                        RuntimeError, "test .*_profile failure"
+                    ):
+                        llm.start_profile()
+                        llm.stop_profile()
+                    with self.assertRaisesRegex(RuntimeError, "idle, open"):
+                        llm.get_diagnostics()
+                self.assertFalse(
+                    [
+                        child
+                        for child in mp.active_children()
+                        if child.pid not in existing
+                    ]
+                )
 
 
 if __name__ == "__main__":
