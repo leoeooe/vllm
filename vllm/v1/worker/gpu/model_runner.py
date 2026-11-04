@@ -167,6 +167,7 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     requires_aux_hidden_states,
     set_eagle3_aux_hidden_state_layers,
 )
+from vllm.v1.worker.gpu.spec_decode.external import ExternalSpeculator
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     RejectionSampler,
     get_max_chunk_logits,
@@ -1801,6 +1802,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.free_states(scheduler_output)
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)
+            if isinstance(self.speculator, ExternalSpeculator):
+                self.speculator.load_drafts(
+                    scheduler_output.scheduled_spec_decode_tokens,
+                    self.req_states.req_id_to_index,
+                    self.req_states.draft_tokens,
+                )
             if self.encoder_cache is not None:
                 # add_requests initializes RoPE positions from CPU metadata first.
                 for req_id, updates in scheduler_output.encoder_input_updates.items():
@@ -2315,7 +2322,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.query_start_loc,
         )
 
-        if self.speculator is not None:
+        if self.speculator is not None and not isinstance(
+            self.speculator, ExternalSpeculator
+        ):
             assert self.sampler is not None
             if isinstance(self.speculator, DraftModelSpeculator):
                 self.speculator.prepare_propose(
@@ -2353,7 +2362,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.speculator.draft_token_confidence_probs, input_batch
                 )
 
-        if self.num_speculative_steps > 0:
+        if self.num_speculative_steps > 0 and not isinstance(
+            self.speculator, ExternalSpeculator
+        ):
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
             draft_tokens = self.req_states.draft_tokens[input_batch.idx_mapping]
@@ -2371,6 +2382,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return async_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
+        if isinstance(self.speculator, ExternalSpeculator):
+            return None
         return self.draft_tokens_handler.get_draft_tokens()
 
     @torch.inference_mode()

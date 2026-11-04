@@ -5,8 +5,36 @@ from dataclasses import replace
 import pytest
 import torch
 
+from vllm.config import SchedulerConfig, SpeculativeConfig, VllmConfig
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.spec_decode.external import ExternalSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
+
+
+@pytest.mark.cpu_test
+def test_external_drafts_follow_request_slots_and_keep_storage(monkeypatch):
+    """Batch rotation must copy actual IDs into the graph's stable storage."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    config = VllmConfig(
+        speculative_config=SpeculativeConfig(
+            method="minedraft", num_speculative_tokens=3
+        ),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=4,
+            max_model_len=32,
+            is_encoder_decoder=False,
+            async_scheduling=False,
+        ),
+    )
+    speculator = ExternalSpeculator(config, torch.device("cpu"))
+    state = torch.full((4, 3), -7, dtype=torch.int64)
+    storage_ptr = state.data_ptr()
+    speculator.load_drafts({"b": [21, 22], "a": [11]}, {"a": 3, "b": 1}, state)
+    assert state.tolist() == [[-7] * 3, [21, 22, -1], [-7] * 3, [11, -1, -1]]
+    speculator.load_drafts({"c": [31, 32, 33]}, {"c": 1}, state)
+    assert state[1].tolist() == [31, 32, 33]
+    assert state[3].tolist() == [11, -1, -1]
+    assert state.data_ptr() == storage_ptr
 
 
 def _input_batch(req_ids: list[str], structured: bool) -> InputBatch:

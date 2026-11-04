@@ -77,6 +77,7 @@ EagleModelTypes = Literal[
 SpeculativeMethod = Literal[
     "ngram",
     "draft_model",
+    "minedraft",
     "suffix",
     "custom_class",
     EagleModelTypes,
@@ -449,6 +450,9 @@ class SpeculativeConfig:
     `model` param, the speculative method type will be detected automatically
     if possible, if `model` param is not provided, the method name must be
     provided.
+
+    `minedraft` receives deterministic draft tokens from an external coordinator
+    and does not load a draft model in the verifier.
 
     If using `ngram` method, the related configuration `prompt_lookup_max` and
     `prompt_lookup_min` should be considered."""
@@ -1358,6 +1362,8 @@ class SpeculativeConfig:
                 self.model = "ngram"
             elif self.method == "ngram_gpu":
                 self.model = "ngram_gpu"
+            elif self.method == "minedraft":
+                self.model = "minedraft"
             elif self.method == "suffix":
                 self.model = "suffix"
             elif self.method == "extract_hidden_states":
@@ -1409,6 +1415,9 @@ class SpeculativeConfig:
             # TODO: current we still need extract vocab_size from target model
             # config, in future, we may try refactor it out, and set
             # draft related config as None here.
+            self.draft_model_config = self.target_model_config
+            self.draft_parallel_config = self.target_parallel_config
+        elif self.method == "minedraft":
             self.draft_model_config = self.target_model_config
             self.draft_parallel_config = self.target_parallel_config
         elif self.method == "suffix":
@@ -2020,6 +2029,24 @@ class SpeculativeConfig:
 
     @model_validator(mode="after")
     def _verify_args(self) -> Self:
+        if self.method == "minedraft":
+            if self.model not in (None, "minedraft"):
+                raise ValueError(
+                    "MineDraft loads the draft model in a separate engine; "
+                    "do not set speculative_config.model."
+                )
+            if self.draft_sample_method != "greedy":
+                raise ValueError("MineDraft requires deterministic greedy drafts.")
+            if (
+                self.rejection_sample_method != "standard"
+                or self.parallel_drafting
+                or self.enable_adaptive_verification
+                or self.num_speculative_tokens_per_batch_size is not None
+            ):
+                raise ValueError(
+                    "MineDraft requires standard rejection sampling and a fixed "
+                    "draft length without parallel drafting or adaptive verification."
+                )
         if self.tensor_parallel_size is not None:
             raise ValueError(
                 "'tensor_parallel_size' is not a valid argument in the "
@@ -2286,6 +2313,7 @@ class SpeculativeConfig:
                 "suffix",
                 "extract_hidden_states",
                 "custom_class",
+                "minedraft",
             )
             else self.draft_model_config.model
         )

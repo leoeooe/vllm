@@ -1658,6 +1658,38 @@ class VllmConfig:
         executor_backend = self.parallel_config.distributed_executor_backend
         executor_class = Executor.get_class(self)
         executor_supports_async_sched = executor_class.supports_async_scheduling()
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.method == "minedraft"
+        ):
+            if not self.use_v2_model_runner:
+                raise ValueError("MineDraft requires Model Runner V2.")
+            if self.scheduler_config.async_scheduling:
+                raise ValueError("MineDraft requires async_scheduling=False.")
+            self.scheduler_config.async_scheduling = False
+            if any(
+                size != 1
+                for size in (
+                    self.parallel_config.pipeline_parallel_size,
+                    self.parallel_config.data_parallel_size,
+                    self.parallel_config.decode_context_parallel_size,
+                    self.parallel_config.prefill_context_parallel_size,
+                )
+            ):
+                raise ValueError(
+                    "Each MineDraft verifier requires PP=DP=DCP=PCP=1. "
+                    "Use independent verifier engines for replicas; TP is supported."
+                )
+            if (
+                self.kv_transfer_config is not None
+                or self.lora_config is not None
+                or self.watermark_config is not None
+                or self.parallel_config.enable_dbo
+            ):
+                raise ValueError(
+                    "MineDraft does not support KV transfer, LoRA, watermarking, "
+                    "or DBO yet."
+                )
         uses_rocm_deepep_ht_dbo = (
             current_platform.is_rocm()
             and self.parallel_config.enable_dbo

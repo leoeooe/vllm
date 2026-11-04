@@ -154,6 +154,159 @@ def test_add_requests():
         assert len(scheduler.waiting) == i + 1
 
 
+@pytest.fixture
+def minedraft_model(tmp_path, monkeypatch):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    (tmp_path / "config.json").write_text(
+        '{"architectures": ["OPTForCausalLM"], "model_type": "opt"}'
+    )
+    return str(tmp_path)
+
+
+def test_minedraft_rotates_batches_without_advancing_inactive_requests(minedraft_model):
+    """Overlapping drafting must leave the inactive committed prefix unchanged."""
+    scheduler = create_scheduler(
+        model=minedraft_model,
+        skip_tokenizer_init=True,
+        speculative_config=SpeculativeConfig(
+            method="minedraft", num_speculative_tokens=2
+        ),
+    )
+    requests = create_requests(num_requests=2, req_ids=["a", "b"])
+    for request in requests:
+        scheduler.add_request(request)
+    assert scheduler.schedule().total_num_scheduled_tokens == 0
+    assert len(scheduler.waiting) == 2
+
+    for request in reversed(requests):
+        req_id = request.request_id
+        scheduler.set_minedraft_batch({req_id}, {})
+        scheduled = scheduler.schedule()
+        assert set(scheduled.num_scheduled_tokens) == {req_id}
+        scheduler.update_from_output(
+            scheduled,
+            ModelRunnerOutput(
+                req_ids=[req_id],
+                req_id_to_index={req_id: 0},
+                sampled_token_ids=[[11]],
+            ),
+        )
+
+    a, b = requests
+    prefix_b = list(b.all_token_ids)
+    frontier = a.num_tokens
+    scheduler.set_minedraft_batch({"a"}, {"a": (frontier, [21, 22])})
+    scheduled = scheduler.schedule()
+    assert scheduled.scheduled_spec_decode_tokens == {"a": [21, 22]}
+    assert scheduled.num_scheduled_tokens == {"a": 3}
+    scheduler.update_from_output(
+        scheduled,
+        ModelRunnerOutput(
+            req_ids=["a"], req_id_to_index={"a": 0}, sampled_token_ids=[[31]]
+        ),
+    )
+    assert a.num_tokens == frontier + 1
+    assert a.num_computed_tokens == a.num_tokens - 1
+    assert list(a.output_token_ids) == [11, 31]
+    assert list(b.all_token_ids) == prefix_b
+
+    with pytest.raises(ValueError, match="Stale MineDraft frontier"):
+        scheduler.set_minedraft_batch({"a"}, {"a": (frontier, [21, 22])})
+    scheduler.set_minedraft_batch({"b"}, {"b": (b.num_tokens, [41])})
+    scheduled = scheduler.schedule()
+    assert scheduled.scheduled_spec_decode_tokens == {"b": [41]}
+    assert set(scheduled.num_scheduled_tokens) == {"b"}
+
+
+@pytest.mark.parametrize("tokens", [[-1], [True], [1, 2, 3], [2**31]])
+def test_minedraft_rejects_invalid_candidates_atomically(minedraft_model, tokens):
+    scheduler = create_scheduler(
+        model=minedraft_model,
+        skip_tokenizer_init=True,
+        speculative_config=SpeculativeConfig(
+            method="minedraft", num_speculative_tokens=2
+        ),
+    )
+    for request in create_requests(num_requests=2, req_ids=["a", "b"]):
+        scheduler.add_request(request)
+    scheduler.set_minedraft_batch({"a"}, {})
+    with pytest.raises(ValueError, match="Invalid MineDraft tokens"):
+        scheduler.set_minedraft_batch({"b"}, {"b": (10, tokens)})
+    assert set(scheduler.schedule().num_scheduled_tokens) == {"a"}
+
+
+def test_minedraft_chunked_prefill_and_cancelled_requests(minedraft_model):
+    scheduler = create_scheduler(
+        model=minedraft_model,
+        skip_tokenizer_init=True,
+        max_num_batched_tokens=4,
+        max_num_seqs=2,
+        max_model_len=32,
+        speculative_config=SpeculativeConfig(
+            method="minedraft", num_speculative_tokens=2
+        ),
+    )
+    requests = create_requests(num_requests=2, req_ids=["a", "b"])
+    for request in requests:
+        scheduler.add_request(request)
+    scheduler.set_minedraft_batch({"b"}, {"b": (10, [21, 22])})
+    scheduled = scheduler.schedule()
+    assert scheduled.num_scheduled_tokens == {"b": 4}
+    assert scheduled.scheduled_spec_decode_tokens == {}
+    assert requests[0].num_computed_tokens == 0
+    scheduler.finish_requests(["a"], RequestStatus.FINISHED_ABORTED)
+    with pytest.raises(ValueError, match="Unknown or finished"):
+        scheduler.set_minedraft_batch({"a"}, {})
+
+
+@pytest.mark.parametrize("policy", ["fcfs", "priority"])
+def test_minedraft_waiting_batch_reclaims_inactive_kv(minedraft_model, policy):
+    """Batch gating must not deadlock admission when inactive KV fills the pool."""
+    scheduler = create_scheduler(
+        model=minedraft_model,
+        skip_tokenizer_init=True,
+        num_blocks=2,  # The block pool reserves one null block.
+        max_num_batched_tokens=32,
+        max_model_len=32,
+        scheduling_policy=policy,
+        speculative_config=SpeculativeConfig(
+            method="minedraft", num_speculative_tokens=2
+        ),
+    )
+    a, b = create_requests(num_requests=2, req_ids=["a", "b"])
+    scheduler.add_request(a)
+    scheduler.add_request(b)
+    scheduler.set_minedraft_batch({"a"}, {})
+    scheduled = scheduler.schedule()
+    assert set(scheduled.num_scheduled_tokens) == {"a"}
+    scheduler.update_from_output(
+        scheduled,
+        ModelRunnerOutput(
+            req_ids=["a"], req_id_to_index={"a": 0}, sampled_token_ids=[[11]]
+        ),
+    )
+    prefix_a = list(a.all_token_ids)
+    scheduler.set_minedraft_batch({"b"}, {})
+    scheduled = scheduler.schedule()
+    assert set(scheduled.num_scheduled_tokens) == {"b"}
+    assert a.status == RequestStatus.PREEMPTED
+    assert a.num_computed_tokens == 0
+    assert list(a.all_token_ids) == prefix_a
+    scheduler.update_from_output(
+        scheduled,
+        ModelRunnerOutput(
+            req_ids=["b"], req_id_to_index={"b": 0}, sampled_token_ids=[[12]]
+        ),
+    )
+    # The previously generated draft is still tied to the same prefix, but KV
+    # has to be rebuilt before it is eligible for speculative verification.
+    scheduler.set_minedraft_batch({"a"}, {"a": (a.num_tokens, [21, 22])})
+    scheduled = scheduler.schedule()
+    assert set(scheduled.num_scheduled_tokens) == {"a"}
+    assert scheduled.scheduled_spec_decode_tokens == {}
+    assert list(a.all_token_ids) == prefix_a
+
+
 @pytest.mark.parametrize("max_tokens", [1, 2])
 def test_routed_experts_prompt_start_at_prompt_end(max_tokens):
     """A prompt-end offset should return empty routing data, not crash."""

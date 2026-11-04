@@ -291,6 +291,12 @@ class Scheduler(SchedulerInterface):
             cache_size=encoder_cache_size, vllm_config=vllm_config
         )
         speculative_config = vllm_config.speculative_config
+        self._minedraft_batch: set[str] | None = (
+            set()
+            if speculative_config is not None
+            and speculative_config.method == "minedraft"
+            else None
+        )
         self.use_eagle = False
         self.use_eagle_block_drop = False
         self.num_spec_tokens = vllm_config.num_speculative_tokens
@@ -793,6 +799,12 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+            if (
+                self._minedraft_batch is not None
+                and request.request_id not in self._minedraft_batch
+            ):
+                req_index += 1
+                continue
             if input_budget <= draft_slots:
                 break
 
@@ -1074,6 +1086,13 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                if (
+                    self._minedraft_batch is not None
+                    and request_id not in self._minedraft_batch
+                ):
+                    skip_request(request_queue)
+                    continue
 
                 ready_to_schedule = self._handle_blocked_waiting_request(request)
                 if not ready_to_schedule:
@@ -1457,6 +1476,26 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    if self._minedraft_batch is not None:
+                        # Inactive batches retain KV while drafting. Unlike a
+                        # normal running request they cannot trigger the usual
+                        # allocation/preemption loop, so reclaim one here.
+                        victims = [
+                            r
+                            for r in self.running
+                            if r.request_id not in self._minedraft_batch
+                            and self._request_blocks_can_be_freed(r)
+                        ]
+                        if victims:
+                            victim = (
+                                max(victims, key=lambda r: (r.priority, r.arrival_time))
+                                if self.policy == SchedulingPolicy.PRIORITY
+                                else victims[-1]
+                            )
+                            self.running.remove(victim)
+                            self._preempt_request(victim, scheduled_timestamp)
+                            preempted_reqs.append(victim)
+                            continue
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -2851,6 +2890,56 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free_encoder_input(request, input_id)
         if self.ec_connector is not None:
             self.ec_connector.update_state_after_free(request, input_id)
+
+    def set_minedraft_batch(
+        self,
+        request_ids: set[str],
+        drafts: dict[str, tuple[int, list[int]]],
+    ) -> None:
+        """Select one external batch and install drafts at its committed frontier.
+
+        Args:
+            request_ids: Only these requests may advance in subsequent steps.
+            drafts: Request ID to (committed token count, deterministic drafts).
+                Selected requests without drafts run ordinary prefill/decode.
+
+        Raises:
+            ValueError: The mode, request IDs, frontier, or tokens are invalid.
+
+        """
+        if self._minedraft_batch is None:
+            raise ValueError("set_minedraft_batch requires method='minedraft'.")
+        if not drafts.keys() <= request_ids:
+            raise ValueError("MineDraft candidates must belong to the selected batch.")
+        for req_id in request_ids:
+            request = self.requests.get(req_id)
+            if request is None or request.is_finished():
+                raise ValueError(f"Unknown or finished MineDraft request: {req_id}")
+            if request.num_in_flight_tokens:
+                raise ValueError(f"MineDraft request is still executing: {req_id}")
+        vocab_size = self.vllm_config.model_config.get_vocab_size()
+        for req_id, (frontier, token_ids) in drafts.items():
+            request = self.requests[req_id]
+            if frontier != request.num_tokens:
+                raise ValueError(f"Stale MineDraft frontier for request {req_id}.")
+            if len(token_ids) > self.num_spec_tokens or any(
+                type(token_id) is not int or not 0 <= token_id < vocab_size
+                for token_id in token_ids
+            ):
+                raise ValueError(f"Invalid MineDraft tokens for request {req_id}.")
+        # Commit only after validating the entire batch. Old unconsumed drafts
+        # must not survive batch rotation or a preemption/re-prefill.
+        for req_id in self._minedraft_batch | request_ids:
+            if (request := self.requests.get(req_id)) is not None:
+                request.spec_token_ids = []
+        self._minedraft_batch = set(request_ids)
+        for req_id, (_, token_ids) in drafts.items():
+            request = self.requests[req_id]
+            if request.num_computed_tokens < request.num_tokens - 1:
+                continue
+            request.spec_token_ids = self.structured_output_manager.trim_spec_tokens(
+                request, list(token_ids)
+            )
 
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
         for req_id, spec_token_ids in zip(

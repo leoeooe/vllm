@@ -19,7 +19,11 @@ def init_speculator(
     """Build the speculator for this config."""
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
-    if speculative_config.method == "extract_hidden_states":
+    if speculative_config.method == "minedraft":
+        from vllm.v1.worker.gpu.spec_decode.external import ExternalSpeculator
+
+        return ExternalSpeculator(vllm_config, device)
+    elif speculative_config.method == "extract_hidden_states":
         from vllm.v1.worker.gpu.spec_decode.extract_hidden_states import (
             ExtractHiddenStatesSpeculator,
         )
